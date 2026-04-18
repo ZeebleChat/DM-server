@@ -1,0 +1,32 @@
+[package]
+name = "zpulse"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-native-tls", "postgres", "macros", "migrate", "json", "uuid", "chrono"] }
+jsonwebtoken = "9"
+base64 = "0.21"
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+pkcs8 = "0.10"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+dotenvy = "0.15"
+axum-extra = { version = "0.9", features = ["typed-header"] }
+futures = "0.3"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
