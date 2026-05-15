@@ -31,7 +31,6 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use handlers::dms::{dm_ws, get_attachment_auth, list_dms, send_dm, upload_file_auth};
-use handlers::livekit::create_token as livekit_dm_token;
 
 // ─── Shared State ─────────────────────────────────────────────────────────────
 
@@ -50,9 +49,6 @@ pub struct AppState {
     pub ed25519_x: String,
     pub connections: Arc<RwLock<Connections>>,
     pub redis: ConnectionManager,
-    pub livekit_url: String,
-    pub livekit_api_key: String,
-    pub livekit_api_secret: String,
 }
 
 // ─── Startup helpers ──────────────────────────────────────────────────────────
@@ -170,6 +166,35 @@ async fn init_database(pool: &PgPool) -> Result<(), sqlx::Error> {
         "CREATE INDEX IF NOT EXISTS idx_channel_messages_channel ON channel_messages(channel_id)",
         "CREATE INDEX IF NOT EXISTS idx_channel_messages_author ON channel_messages(author_id)",
         "CREATE INDEX IF NOT EXISTS idx_voice_rooms_channel ON voice_rooms(channel_id)",
+        // Direct messages
+        "CREATE TABLE IF NOT EXISTS dm_messages (
+            id          BIGSERIAL PRIMARY KEY,
+            sender_beam    TEXT NOT NULL,
+            recipient_beam TEXT NOT NULL,
+            sender_id      TEXT,
+            recipient_id   TEXT,
+            content        TEXT NOT NULL DEFAULT '',
+            created_at     TEXT NOT NULL
+        )",
+        "CREATE TABLE IF NOT EXISTS attachments (
+            id             BIGSERIAL PRIMARY KEY,
+            dm_message_id  BIGINT REFERENCES dm_messages(id) ON DELETE CASCADE,
+            filename       TEXT NOT NULL,
+            mime_type      TEXT NOT NULL,
+            file_size      BIGINT NOT NULL,
+            file_data      BYTEA NOT NULL,
+            uploaded_by    TEXT NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_dm_messages_beams ON dm_messages(sender_beam, recipient_beam)",
+        "CREATE INDEX IF NOT EXISTS idx_attachments_dm ON attachments(dm_message_id)",
+        "CREATE TABLE IF NOT EXISTS channel_message_edits (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            message_id UUID NOT NULL REFERENCES channel_messages(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            edited_by UUID,
+            edited_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_message_edits_message ON channel_message_edits(message_id)",
     ];
 
     for sql in &stmts {
@@ -193,6 +218,33 @@ async fn health_check() -> Json<serde_json::Value> {
         "service": "zpulse",
         "timestamp": Utc::now().to_rfc3339()
     }))
+}
+
+// ─── Status heartbeat ─────────────────────────────────────────────────────────
+
+fn spawn_heartbeat(key: &'static str) {
+    let url = std::env::var("ZSTATUS_URL")
+        .unwrap_or_else(|_| "http://zstatus:8004".to_string());
+    let secret = std::env::var("ZSTATUS_SECRET").unwrap_or_default();
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("heartbeat client");
+        let endpoint = format!("{}/heartbeat", url);
+        loop {
+            let body = serde_json::json!({ "key": key, "ok": true });
+            let mut req = client.post(&endpoint).json(&body);
+            if !secret.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", secret));
+            }
+            if let Err(e) = req.send().await {
+                eprintln!("[heartbeat] zstatus unreachable: {e}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -236,12 +288,6 @@ async fn main() {
         ed25519_x,
         connections: Arc::new(RwLock::new(Connections::default())),
         redis: redis_conn,
-        livekit_url: std::env::var("LIVEKIT_URL")
-            .unwrap_or_else(|_| "http://localhost:7880".to_string()),
-        livekit_api_key: std::env::var("LIVEKIT_API_KEY")
-            .unwrap_or_else(|_| "zeeble-dev-key".to_string()),
-        livekit_api_secret: std::env::var("LIVEKIT_API_SECRET")
-            .unwrap_or_else(|_| "change-me-livekit-secret-min-32-chars".to_string()),
     });
 
     let app = Router::new()
@@ -261,16 +307,14 @@ async fn main() {
         .route("/channels/:id/members", get(channels::get_channel_members))
         .route("/channels/:id/invite", post(channels::create_invite))
         // Channel messages
-        .route("/messages/:channel_id", get(messages::get_messages).post(messages::send_message))
+        .route("/messages/:channel_id", get(messages::get_messages).post(messages::send_message).patch(messages::edit_message))
+        .route("/messages/:message_id/history", get(messages::get_message_history))
         .route("/messages/:channel_id/:message_id", delete(messages::delete_message))
         // Voice
         .route("/voice/join", post(voice::join_voice))
         .route("/voice/leave", post(voice::leave_voice))
         .route("/voice/rooms", get(voice::list_voice_rooms))
         .route("/voice/rooms/:id/participants", get(voice::get_participants))
-        // LiveKit tokens — authenticated DM calls vs channel voice
-        .route("/livekit/token", post(livekit_dm_token))
-        .route("/voice/token", post(voice::get_livekit_token))
         // Health
         .route("/health", get(health_check))
         .with_state(state)
@@ -280,6 +324,8 @@ async fn main() {
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3002".to_string());
     let addr = format!("0.0.0.0:{port}");
+    spawn_heartbeat("dm");
+
     tracing::info!("Zpulse running on http://localhost:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await
         .unwrap_or_else(|e| panic!("Failed to bind {addr}: {e}"));

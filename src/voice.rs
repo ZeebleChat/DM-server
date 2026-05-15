@@ -6,7 +6,6 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -38,13 +37,6 @@ pub struct JoinVoiceRequest {
 #[derive(Debug, Deserialize)]
 pub struct LeaveVoiceRequest {
     pub user_id: Uuid,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GetTokenRequest {
-    pub room_name: String,
-    pub user_id: Uuid,
-    pub username: String,
 }
 
 pub async fn list_voice_rooms(
@@ -195,63 +187,4 @@ pub async fn leave_voice(
     }
 
     Ok(Json(serde_json::json!({ "success": true })))
-}
-
-#[derive(Serialize, Deserialize)]
-struct VideoGrant {
-    #[serde(rename = "roomJoin")]
-    room_join: bool,
-    room: String,
-    #[serde(rename = "canPublish")]
-    can_publish: bool,
-    #[serde(rename = "canSubscribe")]
-    can_subscribe: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct LiveKitClaims {
-    iss: String,
-    sub: String,
-    name: String,
-    exp: u64,
-    nbf: u64,
-    video: VideoGrant,
-}
-
-pub async fn get_livekit_token(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<GetTokenRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let room_name = format!("voice-{}", payload.room_name);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let claims = LiveKitClaims {
-        iss: state.livekit_api_key.clone(),
-        sub: payload.user_id.to_string(),
-        name: payload.username,
-        exp: now + 3600,
-        nbf: 0,
-        video: VideoGrant {
-            room_join: true,
-            room: room_name.clone(),
-            can_publish: true,
-            can_subscribe: true,
-        },
-    };
-
-    let token = encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(state.livekit_api_secret.as_bytes()),
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(serde_json::json!({
-        "token": token,
-        "url": state.livekit_url,
-        "room": room_name
-    })))
 }

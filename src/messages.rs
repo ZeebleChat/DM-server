@@ -120,6 +120,90 @@ pub async fn send_message(
     Ok(Json(message))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EditMessageRequest {
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EditHistoryEntry {
+    pub content: String,
+    pub edited_by: String,
+    pub edited_at: i64,
+}
+
+pub async fn edit_message(
+    State(state): State<Arc<AppState>>,
+    Path(message_id): Path<Uuid>,
+    Json(payload): Json<EditMessageRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if payload.content.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let row = sqlx::query(
+        "SELECT content FROM channel_messages WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let current_content: String = row.get("content");
+
+    sqlx::query(
+        "INSERT INTO channel_message_edits (message_id, content) VALUES ($1, $2)",
+    )
+    .bind(message_id)
+    .bind(&current_content)
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    sqlx::query(
+        "UPDATE channel_messages SET content = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL",
+    )
+    .bind(&payload.content)
+    .bind(message_id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn get_message_history(
+    State(state): State<Arc<AppState>>,
+    Path(message_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rows = sqlx::query(
+        "SELECT content, edited_by, edited_at FROM channel_message_edits
+         WHERE message_id = $1 ORDER BY edited_at ASC",
+    )
+    .bind(message_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let history: Vec<EditHistoryEntry> = rows
+        .iter()
+        .map(|r| {
+            let edited_at: chrono::DateTime<Utc> = r.get("edited_at");
+            EditHistoryEntry {
+                content: r.get("content"),
+                edited_by: r
+                    .try_get::<Uuid, _>("edited_by")
+                    .map(|u| u.to_string())
+                    .unwrap_or_default(),
+                edited_at: edited_at.timestamp(),
+            }
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "history": history })))
+}
+
 pub async fn delete_message(
     State(state): State<Arc<AppState>>,
     Path((channel_id, message_id)): Path<(Uuid, Uuid)>,

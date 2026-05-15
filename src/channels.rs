@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::auth_helpers::extract_token;
 
 #[derive(Debug, Serialize)]
 pub struct Server {
@@ -136,7 +137,27 @@ pub async fn create_server(
 pub async fn get_server_channels(
     State(state): State<Arc<AppState>>,
     Path(server_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<Channel>>, StatusCode> {
+    let claims = extract_token(&state.signing_key, &headers)
+        .await
+        .map_err(|(status, _)| status)?;
+
+    let user_id: Uuid = claims.uid.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let is_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !is_member {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let rows = sqlx::query(
         "SELECT id, server_id, name, channel_type, category_id, position, topic, created_at
          FROM channels WHERE server_id = $1 ORDER BY category_id, position, name",

@@ -99,11 +99,6 @@ pub async fn list_dms(
     }
     let limit = query.limit.unwrap_or(100).min(1000) as i64;
 
-    let partner_id = match get_user_id_by_beam(&state.db, &with).await {
-        Some(id) => id,
-        None => return Ok(Json(Vec::new())),
-    };
-    let current_user_id = claims.uid.clone();
     let current_user_beam = claims.sub.clone();
 
     let rows = sqlx::query(
@@ -111,15 +106,11 @@ pub async fn list_dms(
                 a.id AS att_id, a.filename, a.mime_type, a.file_size
          FROM dm_messages m
          LEFT JOIN attachments a ON m.id = a.dm_message_id
-         WHERE (m.sender_id IS NOT NULL AND m.recipient_id IS NOT NULL AND
-                ((m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1)))
-            OR ((m.sender_id IS NULL OR m.recipient_id IS NULL) AND
-                ((m.sender_beam = $3 AND m.recipient_beam = $4) OR (m.sender_beam = $4 AND m.recipient_beam = $3)))
+         WHERE (m.sender_beam = $1 AND m.recipient_beam = $2)
+            OR (m.sender_beam = $2 AND m.recipient_beam = $1)
          ORDER BY m.created_at ASC, a.id ASC
-         LIMIT $5",
+         LIMIT $3",
     )
-    .bind(&current_user_id)
-    .bind(&partner_id)
     .bind(&current_user_beam)
     .bind(&with)
     .bind(limit)
@@ -209,6 +200,26 @@ pub async fn send_dm(
     Json(req): Json<SendDmRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let claims = extract_token(&*state.signing_key, &headers).await?;
+
+    if claims.account_type == "child" {
+        let pc_val: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT parental_controls FROM users WHERE id = $1",
+        )
+        .bind(&claims.uid)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+        let can_dm = pc_val
+            .and_then(|v| v.get("can_dm").and_then(|b| b.as_bool()))
+            .unwrap_or(true);
+        if !can_dm {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse { error: "Direct messages are disabled by parental controls".into() }),
+            ));
+        }
+    }
+
     let to = req.to.trim().to_string();
     let content = req.content.trim().to_string();
     let attachment_ids = req.attachment_ids.clone();
@@ -221,17 +232,7 @@ pub async fn send_dm(
         ));
     }
 
-    let recipient_id = match get_user_id_by_beam(&state.db, &to).await {
-        Some(uid) => uid,
-        None => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Recipient user not found".into(),
-                }),
-            ));
-        }
-    };
+    let recipient_id = get_user_id_by_beam(&state.db, &to).await;
 
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO dm_messages (sender_beam, recipient_beam, sender_id, recipient_id, content, created_at)
@@ -428,14 +429,7 @@ async fn handle_dm_websocket(
                                 continue;
                             }
 
-                            let recipient_id = match get_user_id_by_beam(&state.db, &req.to).await {
-                                Some(uid) => uid,
-                                None => {
-                                    error!("Recipient user not found for beam: {}", &req.to);
-                                    let _ = sender.send(Message::Text(json!({ "type": "error", "msg": "Recipient not found" }).to_string())).await;
-                                    return;
-                                }
-                            };
+                            let recipient_id = get_user_id_by_beam(&state.db, &req.to).await;
 
                             let id_result: Result<i64, _> = sqlx::query_scalar(
                                 "INSERT INTO dm_messages (sender_beam, recipient_beam, sender_id, recipient_id, content, created_at)
